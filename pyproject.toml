@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "d9s"
+version = "0.2.0"
+description = "k9s-like TUI for Docker"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=8.0.0",
+    "docker>=7.0.0",
+]
+
+[project.scripts]
+d9s = "d9s:main"
+
+[tool.setuptools]
+py-modules = ["d9s"]
