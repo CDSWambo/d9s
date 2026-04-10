@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""d9s - A k9s-like TUI for Docker"""
+"""d9s - A k9s-like TUI for Docker and Podman"""
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 try:
@@ -16,6 +18,111 @@ try:
 except ImportError:
     print("Missing dependency: pip install docker textual")
     sys.exit(1)
+
+
+# ── Container runtime detection ──────────────────────────────────────────────
+
+_PODMAN_SOCKET_PATHS = [
+    Path(f"/run/user/{os.getuid()}/podman/podman.sock"),
+    Path("/run/podman/podman.sock"),
+    Path.home() / ".local" / "share" / "containers" / "podman" / "machine" / "podman.sock",
+]
+
+# Maps runtime name → DockerClient for all active runtimes
+_clients: dict[str, docker.DockerClient] = {}
+# Maps container/resource ID → runtime name
+_id_to_runtime: dict[str, str] = {}
+_detected = False
+
+
+def _detect_runtimes() -> None:
+    """Discover all available container runtimes (Docker + Podman)."""
+    global _detected
+    if _detected:
+        return
+    _detected = True
+
+    # 1) DOCKER_HOST override
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host:
+        try:
+            client = docker.DockerClient(base_url=docker_host)
+            client.ping()
+            name = "podman" if "podman" in docker_host.lower() else "docker"
+            _clients[name] = client
+        except Exception:
+            pass
+
+    # 2) Standard Docker daemon
+    if "docker" not in _clients:
+        try:
+            client = docker.from_env()
+            client.ping()
+            _clients["docker"] = client
+        except Exception:
+            pass
+
+    # 3) Podman socket
+    if "podman" not in _clients:
+        for sock in _PODMAN_SOCKET_PATHS:
+            if sock.exists():
+                try:
+                    client = docker.DockerClient(base_url=f"unix://{sock}")
+                    client.ping()
+                    _clients["podman"] = client
+                    break
+                except Exception:
+                    continue
+
+    if not _clients:
+        raise DockerException(
+            "Cannot connect to Docker or Podman. "
+            "Ensure the Docker daemon is running or the Podman socket is active "
+            "(systemctl --user start podman.socket)."
+        )
+
+
+def _get_client(runtime: str | None = None) -> docker.DockerClient:
+    """Return client for a specific runtime, or the first available one."""
+    _detect_runtimes()
+    if runtime and runtime in _clients:
+        return _clients[runtime]
+    return next(iter(_clients.values()))
+
+
+def _get_all_clients() -> list[tuple[str, docker.DockerClient]]:
+    """Return all active (runtime_name, client) pairs."""
+    _detect_runtimes()
+    return list(_clients.items())
+
+
+def _client_for_id(resource_id: str) -> docker.DockerClient:
+    """Return the client that owns a given container/resource ID."""
+    runtime = _id_to_runtime.get(resource_id)
+    return _get_client(runtime)
+
+
+def _runtime_for_id(resource_id: str) -> str:
+    """Return the runtime name ('docker'/'podman') for a resource ID."""
+    return _id_to_runtime.get(resource_id, next(iter(_clients), "docker"))
+
+
+def _runtime_cmd_for_id(resource_id: str) -> str:
+    """Return the CLI command name for a resource's runtime."""
+    return _runtime_for_id(resource_id)
+
+
+def _strip_rt_prefix(key: str) -> str:
+    """Strip 'docker:' or 'podman:' prefix from a row key."""
+    if key.startswith(("docker:", "podman:")):
+        return key.split(":", 1)[1]
+    return key
+
+
+def _register_ids(runtime: str, ids: list[str]) -> None:
+    """Track which runtime owns which resource IDs."""
+    for rid in ids:
+        _id_to_runtime[rid] = runtime
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -53,6 +160,14 @@ def _ago(ts: int | None) -> str:
 
 def _short(s: str, n: int = 12) -> str:
     return s[:n] if s else ""
+
+
+def _rt_tag(resource_id: str) -> str:
+    """Return a colored runtime tag for display in tables."""
+    rt = _id_to_runtime.get(resource_id, "docker")
+    if rt == "podman":
+        return "[magenta]podman[/magenta]"
+    return "[blue]docker[/blue]"
 
 
 def _bytes(n: int | float) -> str:
@@ -96,17 +211,21 @@ def _cpu_pct(s: dict[str, Any]) -> float:
         return 0.0
 
 
-def _docker_version_info() -> str:
-    try:
-        info = docker.from_env().version()
-        return f"Docker {info.get('Version', '?')}"
-    except Exception:
-        return "Docker"
+@functools.cache
+def _engine_version_info() -> str:
+    parts = []
+    for name, client in _get_all_clients():
+        try:
+            ver = client.version().get("Version", "?")
+            parts.append(f"{name.capitalize()} {ver}")
+        except Exception:
+            parts.append(name.capitalize())
+    return " + ".join(parts) if parts else "unknown"
 
 
 # ── Command suggester ─────────────────────────────────────────────────────────
 
-COMMANDS = ["img", "images", "vol", "volumes", "net", "networks", "com", "compose", "q!", "up", "prune"]
+COMMANDS = ["img", "images", "vol", "volumes", "net", "networks", "com", "compose", "q!", "up", "upd", "upp", "prune"]
 
 
 class CommandSuggester(Suggester):
@@ -118,23 +237,24 @@ class CommandSuggester(Suggester):
     async def get_suggestion(self, value: str) -> str | None:
         if not value:
             return None
-        # Path completion for ":up <path>"
-        if value.startswith("up "):
-            partial = os.path.expanduser(value[3:])
-            if not partial:
+        # Path completion for ":up <path>", ":upd <path>", ":upp <path>"
+        for pfx in ("upp ", "upd ", "up "):
+            if value.startswith(pfx):
+                partial = os.path.expanduser(value[len(pfx):])
+                if not partial:
+                    return None
+                parent = os.path.dirname(partial) or "."
+                prefix = os.path.basename(partial)
+                try:
+                    for entry in sorted(os.listdir(parent)):
+                        if entry.startswith(prefix) and entry != prefix:
+                            full = os.path.join(parent, entry)
+                            if os.path.isdir(full):
+                                full += os.sep
+                            return pfx + full
+                except OSError:
+                    pass
                 return None
-            parent = os.path.dirname(partial) or "."
-            prefix = os.path.basename(partial)
-            try:
-                for entry in sorted(os.listdir(parent)):
-                    if entry.startswith(prefix) and entry != prefix:
-                        full = os.path.join(parent, entry)
-                        if os.path.isdir(full):
-                            full += os.sep
-                        return "up " + full
-            except OSError:
-                pass
-            return None
         for cmd in COMMANDS:
             if cmd.startswith(value) and cmd != value:
                 return cmd
@@ -142,35 +262,48 @@ class CommandSuggester(Suggester):
 
 
 class CommandInput(Input):
-    """Input that uses Tab to accept suggestions and cycle path completions."""
+    """Input that uses Tab/Shift+Tab to accept suggestions and cycle completions."""
+
+    _UP_PREFIXES = ("upp ", "upd ", "up ")
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._tab_matches: list[str] = []
         self._tab_index: int = 0
-        self._tab_prefix: str = ""
+        self._tab_cmd_prefix: str = ""
+        self._cmd_matches: list[str] = []
+        self._cmd_index: int = 0
 
-    def _is_cycling(self, val: str) -> bool:
-        """Check if current value is one of our cycle results."""
-        return any(val == "up " + m for m in self._tab_matches)
+    def _get_up_prefix(self, val: str) -> str | None:
+        for pfx in self._UP_PREFIXES:
+            if val.startswith(pfx):
+                return pfx
+        return None
 
-    def on_key(self, event) -> None:
-        if event.key != "tab":
-            self._tab_matches = []
-            return
-        event.prevent_default()
-        event.stop()
+    def _is_path_cycling(self, val: str) -> bool:
+        return self._tab_cmd_prefix and any(
+            val == self._tab_cmd_prefix + m for m in self._tab_matches
+        )
+
+    def _is_cmd_cycling(self, val: str) -> bool:
+        return val in self._cmd_matches
+
+    def _cycle(self, reverse: bool = False) -> None:
         val = self.value
-        # Path cycling for ":up <path>"
-        if val.startswith("up "):
-            # If already cycling through matches, just advance
-            if self._tab_matches and self._is_cycling(val):
-                self.value = "up " + self._tab_matches[self._tab_index]
+        pfx = self._get_up_prefix(val)
+
+        # ── Path cycling (up /upd /upp  + partial path) ──
+        if pfx:
+            if self._tab_matches and self._is_path_cycling(val):
+                if reverse:
+                    self._tab_index = (self._tab_index - 1) % len(self._tab_matches)
+                self.value = self._tab_cmd_prefix + self._tab_matches[self._tab_index]
                 self.cursor_position = len(self.value)
-                self._tab_index = (self._tab_index + 1) % len(self._tab_matches)
+                if not reverse:
+                    self._tab_index = (self._tab_index + 1) % len(self._tab_matches)
                 return
-            # Build new match list from current input
-            partial = os.path.expanduser(val[3:])
+            # Build new match list
+            partial = os.path.expanduser(val[len(pfx):])
             if not partial:
                 return
             parent = os.path.dirname(partial) or "."
@@ -186,14 +319,40 @@ class CommandInput(Input):
             except OSError:
                 self._tab_matches = []
             if self._tab_matches:
+                self._tab_cmd_prefix = pfx
                 self._tab_index = 0
-                self.value = "up " + self._tab_matches[self._tab_index]
+                self.value = pfx + self._tab_matches[self._tab_index]
                 self.cursor_position = len(self.value)
                 self._tab_index = (self._tab_index + 1) % len(self._tab_matches)
-        # Command name completion
-        elif self._suggestion and self._suggestion != self.value:
-            self.value = self._suggestion
+            return
+
+        # ── Command cycling ──
+        if self._cmd_matches and self._is_cmd_cycling(val):
+            if reverse:
+                self._cmd_index = (self._cmd_index - 1) % len(self._cmd_matches)
+            self.value = self._cmd_matches[self._cmd_index]
             self.cursor_position = len(self.value)
+            if not reverse:
+                self._cmd_index = (self._cmd_index + 1) % len(self._cmd_matches)
+            return
+
+        # Build command match list
+        if val:
+            self._cmd_matches = [c for c in COMMANDS if c.startswith(val)]
+            if self._cmd_matches:
+                self._cmd_index = 0
+                self.value = self._cmd_matches[self._cmd_index]
+                self.cursor_position = len(self.value)
+                self._cmd_index = (self._cmd_index + 1) % len(self._cmd_matches)
+
+    def on_key(self, event) -> None:
+        if event.key == "tab":
+            event.prevent_default()
+            event.stop()
+            self._cycle(reverse=False)
+        else:
+            self._tab_matches = []
+            self._cmd_matches = []
 
 
 # ── Fuzzy file finder (fzf-style) ────────────────────────────────────────────
@@ -671,7 +830,7 @@ class LogScreen(Screen):
     def _stream(self) -> None:
         log = self.query_one("#out", Log)
         try:
-            c = docker.from_env().containers.get(self.container_id)
+            c = _client_for_id(self.container_id).containers.get(self.container_id)
             for line in c.logs(stream=True, follow=True, tail=300):
                 if self._stop:
                     break
@@ -715,7 +874,7 @@ class StatsScreen(Screen):
     def _poll(self) -> None:
         content = self.query_one("#content", Static)
         try:
-            c = docker.from_env().containers.get(self.container_id)
+            c = _client_for_id(self.container_id).containers.get(self.container_id)
             for raw in c.stats(stream=True, decode=True):
                 if self._stop:
                     break
@@ -796,7 +955,7 @@ class DescribeScreen(Screen):
     @work(thread=True)
     def _fetch(self) -> None:
         try:
-            self._attrs = docker.from_env().containers.get(self.container_id).attrs
+            self._attrs = _client_for_id(self.container_id).containers.get(self.container_id).attrs
             self.app.call_from_thread(self._render_describe)
         except Exception as exc:
             self.app.call_from_thread(self.query_one("#content", Static).update, f"[red]{exc}[/red]")
@@ -1056,9 +1215,10 @@ class K9sResourceScreen(Screen):
     ]
 
     def _make_header_info(self) -> str:
+        ctx = " + ".join(r for r, _ in _get_all_clients())
         return (
-            f"[bold white]Context:[/bold white] [cyan]docker-desktop[/cyan]\n"
-            f"[bold white]Engine:[/bold white]  [cyan]{_docker_version_info()}[/cyan]"
+            f"[bold white]Context:[/bold white] [cyan]{ctx}[/cyan]\n"
+            f"[bold white]Engine:[/bold white]  [cyan]{_engine_version_info()}[/cyan]"
         )
 
     def _compose_header(self) -> ComposeResult:
@@ -1141,7 +1301,7 @@ class ImagesScreen(K9sResourceScreen):
         yield DataTable(id="tbl", cursor_type="row", zebra_stripes=True)
 
     def on_mount(self) -> None:
-        self.query_one("#tbl", DataTable).add_columns("ID", "Repository", "Tag", "Size", "Created")
+        self.query_one("#tbl", DataTable).add_columns("RT", "ID", "Repository", "Tag", "Size", "Created")
         self._load()
 
     @work(thread=True)
@@ -1149,17 +1309,24 @@ class ImagesScreen(K9sResourceScreen):
         try:
             tbl = self.query_one("#tbl", DataTable)
             self.app.call_from_thread(tbl.clear)
-            for img in docker.from_env().images.list():
-                tags = img.tags
-                repo, tag = (tags[0].rsplit(":", 1) if tags and ":" in tags[0] else (tags[0] if tags else "<none>", "latest" if tags else "<none>"))
-                self.app.call_from_thread(
-                    tbl.add_row,
-                    _short(img.short_id.replace("sha256:", ""), 12),
-                    repo[:42], tag,
-                    _bytes(img.attrs.get("Size", 0)),
-                    _ago(_parse_ts(img.attrs.get("Created", ""))),
-                    key=img.id,
-                )
+            for rt_name, rt_client in _get_all_clients():
+                try:
+                    imgs = rt_client.images.list()
+                    _register_ids(rt_name, [i.id for i in imgs])
+                    for img in imgs:
+                        tags = img.tags
+                        repo, tag = (tags[0].rsplit(":", 1) if tags and ":" in tags[0] else (tags[0] if tags else "<none>", "latest" if tags else "<none>"))
+                        self.app.call_from_thread(
+                            tbl.add_row,
+                            _rt_tag(img.id),
+                            _short(img.short_id.replace("sha256:", ""), 12),
+                            repo[:42], tag,
+                            _bytes(img.attrs.get("Size", 0)),
+                            _ago(_parse_ts(img.attrs.get("Created", ""))),
+                            key=f"{rt_name}:{img.id}",
+                        )
+                except Exception:
+                    pass
         except Exception as exc:
             self.app.call_from_thread(self.notify, str(exc), severity="error")
 
@@ -1172,15 +1339,15 @@ class ImagesScreen(K9sResourceScreen):
         if not tbl.row_count:
             return
         rk, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
-        self._do_inspect(rk.value)
+        self._do_inspect(_strip_rt_prefix(rk.value))
 
     @on(DataTable.RowSelected)
     def _on_row_selected(self, event: DataTable.RowSelected) -> None:
-        self._do_inspect(event.row_key.value)
+        self._do_inspect(_strip_rt_prefix(event.row_key.value))
 
     def _do_inspect(self, image_id: str) -> None:
         try:
-            img = docker.from_env().images.get(image_id)
+            img = _client_for_id(image_id).images.get(image_id)
             tags = ", ".join(img.tags) if img.tags else img.short_id
             self.app.push_screen(InspectScreen(tags, img.attrs))
         except Exception as exc:
@@ -1191,11 +1358,12 @@ class ImagesScreen(K9sResourceScreen):
         if not tbl.row_count:
             return
         rk, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
+        rid = _strip_rt_prefix(rk.value)
 
         def _do(ok: bool) -> None:
             if ok:
                 try:
-                    docker.from_env().images.remove(rk.value, force=True)
+                    _client_for_id(rid).images.remove(rid, force=True)
                     self.notify("Image removed")
                     self._load()
                 except Exception as exc:
@@ -1207,8 +1375,11 @@ class ImagesScreen(K9sResourceScreen):
         def _do(ok: bool) -> None:
             if ok:
                 try:
-                    r = docker.from_env().images.prune()
-                    self.notify(f"Pruned dangling images — freed {_bytes(r.get('SpaceReclaimed', 0))}")
+                    total = 0
+                    for _, rc in _get_all_clients():
+                        r = rc.images.prune()
+                        total += r.get("SpaceReclaimed", 0)
+                    self.notify(f"Pruned dangling images — freed {_bytes(total)}")
                     self._load()
                 except Exception as exc:
                     self.notify(str(exc), severity="error")
@@ -1241,7 +1412,7 @@ class VolumesScreen(K9sResourceScreen):
         yield DataTable(id="tbl", cursor_type="row", zebra_stripes=True)
 
     def on_mount(self) -> None:
-        self.query_one("#tbl", DataTable).add_columns("Name", "Driver", "Mountpoint")
+        self.query_one("#tbl", DataTable).add_columns("RT", "Name", "Driver", "Mountpoint")
         self._load()
 
     @work(thread=True)
@@ -1249,12 +1420,18 @@ class VolumesScreen(K9sResourceScreen):
         try:
             tbl = self.query_one("#tbl", DataTable)
             self.app.call_from_thread(tbl.clear)
-            for v in docker.from_env().volumes.list():
-                self.app.call_from_thread(
-                    tbl.add_row,
-                    v.name, v.attrs.get("Driver", ""), v.attrs.get("Mountpoint", ""),
-                    key=v.name,
-                )
+            for rt_name, rt_client in _get_all_clients():
+                try:
+                    vl = rt_client.volumes.list()
+                    _register_ids(rt_name, [v.name for v in vl])
+                    for v in vl:
+                        self.app.call_from_thread(
+                            tbl.add_row,
+                            _rt_tag(v.name), v.name, v.attrs.get("Driver", ""), v.attrs.get("Mountpoint", ""),
+                            key=f"{rt_name}:{v.name}",
+                        )
+                except Exception:
+                    pass
         except Exception as exc:
             self.app.call_from_thread(self.notify, str(exc), severity="error")
 
@@ -1267,15 +1444,15 @@ class VolumesScreen(K9sResourceScreen):
         if not tbl.row_count:
             return
         rk, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
-        self._do_inspect(rk.value)
+        self._do_inspect(_strip_rt_prefix(rk.value))
 
     @on(DataTable.RowSelected)
     def _on_row_selected(self, event: DataTable.RowSelected) -> None:
-        self._do_inspect(event.row_key.value)
+        self._do_inspect(_strip_rt_prefix(event.row_key.value))
 
     def _do_inspect(self, name: str) -> None:
         try:
-            vol = docker.from_env().volumes.get(name)
+            vol = _client_for_id(name).volumes.get(name)
             self.app.push_screen(InspectScreen(vol.name, vol.attrs))
         except Exception as exc:
             self.notify(str(exc), severity="error")
@@ -1285,11 +1462,12 @@ class VolumesScreen(K9sResourceScreen):
         if not tbl.row_count:
             return
         rk, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
+        rid = _strip_rt_prefix(rk.value)
 
         def _do(ok: bool) -> None:
             if ok:
                 try:
-                    docker.from_env().volumes.get(rk.value).remove(force=True)
+                    _client_for_id(rid).volumes.get(rid).remove(force=True)
                     self.notify("Volume removed")
                     self._load()
                 except Exception as exc:
@@ -1301,8 +1479,11 @@ class VolumesScreen(K9sResourceScreen):
         def _do(ok: bool) -> None:
             if ok:
                 try:
-                    r = docker.from_env().volumes.prune()
-                    self.notify(f"Pruned unused volumes — freed {_bytes(r.get('SpaceReclaimed', 0))}")
+                    total = 0
+                    for _, rc in _get_all_clients():
+                        r = rc.volumes.prune()
+                        total += r.get("SpaceReclaimed", 0)
+                    self.notify(f"Pruned unused volumes — freed {_bytes(total)}")
                     self._load()
                 except Exception as exc:
                     self.notify(str(exc), severity="error")
@@ -1335,7 +1516,7 @@ class NetworksScreen(K9sResourceScreen):
         yield DataTable(id="tbl", cursor_type="row", zebra_stripes=True)
 
     def on_mount(self) -> None:
-        self.query_one("#tbl", DataTable).add_columns("ID", "Name", "Driver", "Scope", "Subnet", "Ctrs")
+        self.query_one("#tbl", DataTable).add_columns("RT", "ID", "Name", "Driver", "Scope", "Subnet", "Ctrs")
         self._load()
 
     @work(thread=True)
@@ -1343,17 +1524,23 @@ class NetworksScreen(K9sResourceScreen):
         try:
             tbl = self.query_one("#tbl", DataTable)
             self.app.call_from_thread(tbl.clear)
-            for n in docker.from_env().networks.list():
-                configs = (n.attrs.get("IPAM", {}).get("Config") or [])
-                subnet  = configs[0].get("Subnet", "") if configs else ""
-                ctrs    = len(n.attrs.get("Containers") or {})
-                self.app.call_from_thread(
-                    tbl.add_row,
-                    _short(n.id, 12), n.name,
-                    n.attrs.get("Driver", ""), n.attrs.get("Scope", ""),
-                    subnet, str(ctrs),
-                    key=n.id,
-                )
+            for rt_name, rt_client in _get_all_clients():
+                try:
+                    nl = rt_client.networks.list()
+                    _register_ids(rt_name, [n.id for n in nl])
+                    for n in nl:
+                        configs = (n.attrs.get("IPAM", {}).get("Config") or [])
+                        subnet  = configs[0].get("Subnet", "") if configs else ""
+                        ctrs    = len(n.attrs.get("Containers") or {})
+                        self.app.call_from_thread(
+                            tbl.add_row,
+                            _rt_tag(n.id), _short(n.id, 12), n.name,
+                            n.attrs.get("Driver", ""), n.attrs.get("Scope", ""),
+                            subnet, str(ctrs),
+                            key=f"{rt_name}:{n.id}",
+                        )
+                except Exception:
+                    pass
         except Exception as exc:
             self.app.call_from_thread(self.notify, str(exc), severity="error")
 
@@ -1366,15 +1553,15 @@ class NetworksScreen(K9sResourceScreen):
         if not tbl.row_count:
             return
         rk, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
-        self._do_inspect(rk.value)
+        self._do_inspect(_strip_rt_prefix(rk.value))
 
     @on(DataTable.RowSelected)
     def _on_row_selected(self, event: DataTable.RowSelected) -> None:
-        self._do_inspect(event.row_key.value)
+        self._do_inspect(_strip_rt_prefix(event.row_key.value))
 
     def _do_inspect(self, net_id: str) -> None:
         try:
-            net = docker.from_env().networks.get(net_id)
+            net = _client_for_id(net_id).networks.get(net_id)
             self.app.push_screen(InspectScreen(net.name, net.attrs))
         except Exception as exc:
             self.notify(str(exc), severity="error")
@@ -1384,11 +1571,12 @@ class NetworksScreen(K9sResourceScreen):
         if not tbl.row_count:
             return
         rk, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
+        rid = _strip_rt_prefix(rk.value)
 
         def _do(ok: bool) -> None:
             if ok:
                 try:
-                    docker.from_env().networks.get(rk.value).remove()
+                    _client_for_id(rid).networks.get(rid).remove()
                     self.notify("Network removed")
                     self._load()
                 except Exception as exc:
@@ -1400,7 +1588,8 @@ class NetworksScreen(K9sResourceScreen):
         def _do(ok: bool) -> None:
             if ok:
                 try:
-                    docker.from_env().networks.prune()
+                    for _, rc in _get_all_clients():
+                        rc.networks.prune()
                     self.notify("Pruned unused networks")
                     self._load()
                 except Exception as exc:
@@ -1441,7 +1630,7 @@ class ComposeScreen(K9sResourceScreen):
 
     def on_mount(self) -> None:
         self.query_one("#tbl", DataTable).add_columns(
-            "Project", "Dir", "Services", "Running", "Stopped"
+            "RT", "Project", "Dir", "Services", "Running", "Stopped"
         )
         self._load()
 
@@ -1449,7 +1638,15 @@ class ComposeScreen(K9sResourceScreen):
     def _load(self) -> None:
         try:
             projects: dict[str, dict[str, Any]] = {}
-            for c in docker.from_env().containers.list(all=True):
+            all_compose_containers: list[tuple[str, Any]] = []
+            for rt_name, rt_client in _get_all_clients():
+                try:
+                    cl = rt_client.containers.list(all=True)
+                    _register_ids(rt_name, [c.id for c in cl])
+                    all_compose_containers.extend((rt_name, c) for c in cl)
+                except Exception:
+                    pass
+            for rt_name, c in all_compose_containers:
                 labels = c.labels or {}
                 proj = labels.get("com.docker.compose.project")
                 if not proj:
@@ -1461,6 +1658,7 @@ class ComposeScreen(K9sResourceScreen):
                         "running":  0,
                         "stopped":  0,
                     }
+                    _register_ids(rt_name, [proj])
                 projects[proj]["services"].add(labels.get("com.docker.compose.service", "?"))
                 if c.status == "running":
                     projects[proj]["running"] += 1
@@ -1472,11 +1670,11 @@ class ComposeScreen(K9sResourceScreen):
             for name, info in sorted(projects.items()):
                 self.app.call_from_thread(
                     tbl.add_row,
-                    name, info["dir"][-50:],
+                    _rt_tag(name), name, info["dir"][-50:],
                     str(len(info["services"])),
                     f"[green]{info['running']}[/green]",
                     f"[red]{info['stopped']}[/red]",
-                    key=name,
+                    key=f"{_runtime_for_id(name)}:{name}",
                 )
         except Exception as exc:
             self.app.call_from_thread(self.notify, str(exc), severity="error")
@@ -1488,7 +1686,7 @@ class ComposeScreen(K9sResourceScreen):
         proj, wd = sel
         try:
             r = subprocess.run(
-                ["docker", "compose", "--project-name", proj, "config"],
+                [_runtime_cmd_for_id(proj), "compose", "--project-name", proj, "config"],
                 capture_output=True, text=True, cwd=wd,
             )
             if r.returncode == 0:
@@ -1518,11 +1716,12 @@ class ComposeScreen(K9sResourceScreen):
             return None
         try:
             rk, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
-            proj = rk.value
-            for c in docker.from_env().containers.list(all=True):
-                labels = c.labels or {}
-                if labels.get("com.docker.compose.project") == proj:
-                    return proj, labels.get("com.docker.compose.project.working_dir", ".")
+            proj = _strip_rt_prefix(rk.value)
+            for _, rt_client in _get_all_clients():
+                for c in rt_client.containers.list(all=True):
+                    labels = c.labels or {}
+                    if labels.get("com.docker.compose.project") == proj:
+                        return proj, labels.get("com.docker.compose.project.working_dir", ".")
             return proj, "."
         except Exception:
             return None
@@ -1536,7 +1735,7 @@ class ComposeScreen(K9sResourceScreen):
         args = self._pending_compose_args
         try:
             r = subprocess.run(
-                ["docker", "compose", "--project-name", proj, *args],
+                [_runtime_cmd_for_id(proj), "compose", "--project-name", proj, *args],
                 capture_output=True, text=True, cwd=wd,
             )
             msg = f"compose {' '.join(args)} OK" if r.returncode == 0 else (r.stderr[:200] or "error")
@@ -1575,7 +1774,9 @@ class ComposeScreen(K9sResourceScreen):
         proj, _ = sel
         try:
             cids = [
-                c.id for c in docker.from_env().containers.list(all=True)
+                c.id
+                for _, rt_client in _get_all_clients()
+                for c in rt_client.containers.list(all=True)
                 if (c.labels or {}).get("com.docker.compose.project") == proj and c.status == "running"
             ]
         except Exception:
@@ -1593,6 +1794,12 @@ class ComposeScreen(K9sResourceScreen):
 # ── Help ──────────────────────────────────────────────────────────────────────
 
 HELP_TEXT = """\
+[bold cyan]Runtime support[/bold cyan]
+  d9s auto-detects Docker and Podman.
+  Both runtimes are shown side by side.
+  The [blue]docker[/blue] / [magenta]podman[/magenta] column (RT) shows which
+  runtime owns each resource.
+
 [bold cyan]Containers[/bold cyan]
   [cyan]arrows[/cyan]         Navigate
   [cyan]enter / d[/cyan]      Describe (inspect)
@@ -1617,9 +1824,15 @@ HELP_TEXT = """\
   [cyan]:vol[/cyan]           Volumes
   [cyan]:net[/cyan]           Networks
   [cyan]:compose[/cyan]       Compose projects
-  [cyan]:up[/cyan]             Find compose files (fuzzy finder)
-  [cyan]:up <path>[/cyan]     Compose up from path
+  [cyan]:up[/cyan]            Find compose files (fuzzy finder)
+  [cyan]:up <path>[/cyan]     Compose up from path (auto-detect runtime)
+  [cyan]:upd[/cyan]           Find compose files — force Docker
+  [cyan]:upd <path>[/cyan]    Compose up from path — force Docker
+  [cyan]:upp[/cyan]           Find compose files — force Podman
+  [cyan]:upp <path>[/cyan]    Compose up from path — force Podman
+  [cyan]:prune[/cyan]         System prune
   [cyan]:q![/cyan]            Quit
+  Tab cycles through commands and path completions.
 
 [bold cyan]Navigation[/bold cyan]
   [cyan]1[/cyan]              Containers
@@ -1627,7 +1840,7 @@ HELP_TEXT = """\
   [cyan]3[/cyan]              Volumes
   [cyan]4[/cyan]              Networks
   [cyan]5[/cyan]              Compose projects
-  [cyan]P[/cyan]              System prune (sudo docker system prune --all)
+  [cyan]P[/cyan]              System prune (all runtimes)
   [cyan]?[/cyan]              This help
   [cyan]ctrl+c[/cyan]         Quit
 
@@ -1639,9 +1852,9 @@ HELP_TEXT = """\
 
 [bold cyan]Compose[/bold cyan]
   [cyan]enter[/cyan]          Inspect (compose config)
-  [cyan]u[/cyan]              docker compose up -d
-  [cyan]w[/cyan]              docker compose down
-  [cyan]r[/cyan]              docker compose restart
+  [cyan]u[/cyan]              compose up -d
+  [cyan]w[/cyan]              compose down
+  [cyan]r[/cyan]              compose restart
   [cyan]R[/cyan]              Refresh
   [cyan]l[/cyan]              Logs (first running service)
 
@@ -1783,7 +1996,7 @@ class ContainersScreen(K9sResourceScreen):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#tbl", DataTable)
-        tbl.add_columns("ID", "Name", "Image", "State", "Ports", "Age", "Compose")
+        tbl.add_columns("RT", "ID", "Name", "Image", "State", "Ports", "Age", "Compose")
         tbl.focus()
         self._refresh_timer = self.set_interval(5, self._auto_load)
         self._load()
@@ -1828,6 +2041,7 @@ class ContainersScreen(K9sResourceScreen):
         labels = c.labels or {}
         compose_dir = labels.get("com.docker.compose.project.working_dir", "-")
         cells = [
+            _rt_tag(c.id),
             _short(c.short_id, 12),
             name,
             image_name[:34],
@@ -1842,7 +2056,14 @@ class ContainersScreen(K9sResourceScreen):
     def _load(self) -> None:
         try:
             ws = self.workspace
-            all_containers = docker.from_env().containers.list(all=True)
+            all_containers = []
+            for rt_name, rt_client in _get_all_clients():
+                try:
+                    cl = rt_client.containers.list(all=True)
+                    _register_ids(rt_name, [c.id for c in cl])
+                    all_containers.extend(cl)
+                except Exception:
+                    pass
 
             # Count states across ALL containers
             counts: dict[str, int] = {}
@@ -1876,9 +2097,11 @@ class ContainersScreen(K9sResourceScreen):
                 if filt and filt not in name.lower():
                     continue
                 cid, cells, meta = self._build_row(c)
-                new_rows[cid] = cells
+                rt = _runtime_for_id(cid)
+                table_key = f"{rt}:{cid}"
+                new_rows[table_key] = cells
                 new_meta[cid] = meta
-                new_order.append(cid)
+                new_order.append(table_key)
 
             # Apply diff to table instead of clear+rebuild
             self.app.call_from_thread(self._apply_table_diff, tbl, new_rows, new_order)
@@ -1931,7 +2154,7 @@ class ContainersScreen(K9sResourceScreen):
             return None
         try:
             rk, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
-            return rk.value
+            return _strip_rt_prefix(rk.value)
         except Exception:
             return None
 
@@ -1991,14 +2214,21 @@ class ContainersScreen(K9sResourceScreen):
         self.query_one("#cmd-bar").remove_class("visible")
         self.query_one("#tbl", DataTable).focus()
 
-        # Handle :up — open file finder or use path directly
-        if cmd == "up":
-            self._open_file_finder()
-            return
-        if cmd.startswith("up "):
-            path = os.path.expanduser(raw[3:].strip())
-            self._cmd_compose_up(path)
-            return
+        # Handle :up / :upd / :upp — open file finder or use path directly
+        # :up         → file finder, default runtime
+        # :upd        → file finder, force docker
+        # :upp        → file finder, force podman
+        # :up <path>  → direct path, default runtime
+        # :upd <path> → direct path, force docker
+        # :upp <path> → direct path, force podman
+        for up_cmd, rt in (("upp", "podman"), ("upd", "docker"), ("up", None)):
+            if cmd == up_cmd:
+                self._open_file_finder(runtime=rt)
+                return
+            if cmd.startswith(up_cmd + " "):
+                path = os.path.expanduser(raw[len(up_cmd) + 1:].strip())
+                self._cmd_compose_up(path, runtime=rt)
+                return
 
         commands = {
             "img": self.action_goto_images,
@@ -2019,13 +2249,13 @@ class ContainersScreen(K9sResourceScreen):
         else:
             self.notify(f"Unknown command: {cmd}", severity="warning")
 
-    def _open_file_finder(self) -> None:
+    def _open_file_finder(self, runtime: str | None = None) -> None:
         def _on_result(path: str | None) -> None:
             if path:
-                self._cmd_compose_up(path)
+                self._cmd_compose_up(path, runtime=runtime)
         self.app.push_screen(FileFinder(os.getcwd()), _on_result)
 
-    def _cmd_compose_up(self, path: str) -> None:
+    def _cmd_compose_up(self, path: str, runtime: str | None = None) -> None:
         """Start a compose project from a path (file or directory)."""
         if os.path.isfile(path):
             compose_file = path
@@ -2044,12 +2274,13 @@ class ContainersScreen(K9sResourceScreen):
         else:
             self.notify(f"Path not found: {path}", severity="error")
             return
-        self._run_compose_from_file(project_dir, compose_file)
+        self._run_compose_from_file(project_dir, compose_file, runtime=runtime)
 
     @work(thread=True)
-    def _run_compose_from_file(self, project_dir: str, compose_file: str) -> None:
+    def _run_compose_from_file(self, project_dir: str, compose_file: str, runtime: str | None = None) -> None:
         try:
-            cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
+            rt = runtime or _runtime_cmd_for_id(compose_file)
+            cmd = [rt, "compose", "-f", compose_file, "up", "-d"]
             r = subprocess.run(cmd, cwd=project_dir, capture_output=True, text=True)
             if r.returncode == 0:
                 self.app.call_from_thread(self.notify, f"Compose up from {compose_file}")
@@ -2064,7 +2295,7 @@ class ContainersScreen(K9sResourceScreen):
     def _run_on_worker(self) -> None:
         cid, action = self._pending_action
         try:
-            getattr(docker.from_env().containers.get(cid), action)()
+            getattr(_client_for_id(cid).containers.get(cid), action)()
             self.app.call_from_thread(self.notify, f"{action} OK")
             self.app.call_from_thread(self._load)
         except Exception as exc:
@@ -2089,7 +2320,7 @@ class ContainersScreen(K9sResourceScreen):
         import shlex
         with self.app.suspend():
             os.system(
-                f"docker exec -it {shlex.quote(cid)} /bin/sh -c "
+                f"{_runtime_cmd_for_id(cid)} exec -it {shlex.quote(cid)} /bin/sh -c "
                 f"'command -v bash >/dev/null 2>&1 && exec bash || exec sh'"
             )
 
@@ -2148,7 +2379,7 @@ class ContainersScreen(K9sResourceScreen):
             if not result.get("confirmed"):
                 return
             try:
-                docker.from_env().containers.get(cid).remove(
+                _client_for_id(cid).containers.get(cid).remove(
                     force=True, v=result.get("volumes", False)
                 )
                 msg = "Container removed"
@@ -2172,7 +2403,7 @@ class ContainersScreen(K9sResourceScreen):
         if not cid:
             return
         try:
-            c = docker.from_env().containers.get(cid)
+            c = _client_for_id(cid).containers.get(cid)
             project = (c.labels or {}).get("com.docker.compose.project")
             project_dir = (c.labels or {}).get("com.docker.compose.project.working_dir")
         except Exception:
@@ -2199,7 +2430,7 @@ class ContainersScreen(K9sResourceScreen):
     @work(thread=True)
     def _run_compose_down(self, project: str, project_dir: str, volumes: bool) -> None:
         try:
-            cmd = ["docker", "compose", "-p", project, "down"]
+            cmd = [_runtime_cmd_for_id(project), "compose", "-p", project, "down"]
             if volumes:
                 cmd.append("-v")
             subprocess.run(cmd, cwd=project_dir, capture_output=True, text=True, check=True)
@@ -2223,7 +2454,7 @@ class ContainersScreen(K9sResourceScreen):
         cid = self._selected()
         if cid:
             try:
-                c = docker.from_env().containers.get(cid)
+                c = _client_for_id(cid).containers.get(cid)
                 project = (c.labels or {}).get("com.docker.compose.project")
                 project_dir = (c.labels or {}).get("com.docker.compose.project.working_dir")
                 if project and project_dir:
@@ -2236,7 +2467,7 @@ class ContainersScreen(K9sResourceScreen):
     @work(thread=True)
     def _run_compose_up(self, project: str, project_dir: str) -> None:
         try:
-            cmd = ["docker", "compose", "-p", project, "up", "-d"]
+            cmd = [_runtime_cmd_for_id(project), "compose", "-p", project, "up", "-d"]
             subprocess.run(cmd, cwd=project_dir, capture_output=True, text=True, check=True)
             self._last_compose = None
             self.app.call_from_thread(self.notify, f"Compose up {project}")
@@ -2256,20 +2487,27 @@ class ContainersScreen(K9sResourceScreen):
     @work(thread=True)
     def _run_system_prune(self, password: str, force: bool) -> None:
         try:
-            cmd = ["sudo", "-S", "docker", "system", "prune", "--all"]
-            if force:
-                cmd.append("--force")
-            proc = subprocess.run(
-                cmd,
-                input=password + "\n",
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode == 0:
+            errors = []
+            for rt_name, _ in _get_all_clients():
+                if rt_name == "podman":
+                    cmd = ["podman", "system", "prune", "--all"]
+                else:
+                    cmd = ["sudo", "-S", "docker", "system", "prune", "--all"]
+                if force:
+                    cmd.append("--force")
+                proc = subprocess.run(
+                    cmd,
+                    input=password + "\n" if rt_name != "podman" else None,
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode != 0:
+                    errors.append(f"{rt_name}: {proc.stderr.strip()}")
+            if not errors:
                 self.app.call_from_thread(self.notify, "System prune completed")
                 self.app.call_from_thread(self._load)
             else:
-                err = proc.stderr.strip()
+                err = errors[0]
                 if "incorrect password" in err.lower() or "sorry" in err.lower():
                     self.app.call_from_thread(self.notify, "Wrong sudo password", severity="error")
                 else:
@@ -2308,9 +2546,9 @@ class D9s(App):
 
 def main() -> None:
     try:
-        docker.from_env().ping()
+        _detect_runtimes()
     except DockerException as exc:
-        print(f"Cannot connect to Docker daemon: {exc}", file=sys.stderr)
+        print(f"Cannot connect to Docker or Podman: {exc}", file=sys.stderr)
         sys.exit(1)
     D9s().run()
 
