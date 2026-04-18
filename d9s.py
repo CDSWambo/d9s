@@ -405,6 +405,14 @@ class FileFinder(ModalScreen[str | None]):
     def _on_filter(self, event: Input.Changed) -> None:
         self._update_table(event.value)
 
+    @on(Input.Submitted, "#finder-input")
+    def _on_submit(self, event: Input.Submitted) -> None:
+        self.action_select()
+
+    @on(DataTable.RowSelected, "#finder-tbl")
+    def _on_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.action_select()
+
     def _update_table(self, query: str) -> None:
         tbl = self.query_one("#finder-tbl", DataTable)
         tbl.clear()
